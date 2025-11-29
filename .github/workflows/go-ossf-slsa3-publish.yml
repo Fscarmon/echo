@@ -25,6 +25,15 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git build-essential
     
+    # --- 关键新增步骤：移除标准 Go ---
+    - name: Uninstall Standard Go from Tool Cache
+      run: |
+        echo "Attempting to forcefully remove standard Go installation to avoid PATH conflicts."
+        # 移除 GitHub Actions runner 托管工具缓存中的所有 Go 版本
+        sudo rm -rf /opt/hostedtoolcache/go
+        echo "Standard Go tool cache cleared."
+    # ------------------------------------
+    
     # --- 缓存 1: Go 模块和构建缓存 ---
     - name: Cache Go modules and build cache
       uses: actions/cache@v4
@@ -74,6 +83,7 @@ jobs:
     
     - name: Initialize Go module and get dependencies
       run: |
+        # 即使标准 Go 已被移除，我们仍然需要确保 PATH 正确指向 ECH Go
         export PATH=/tmp/cf-go/bin:$PATH
         
         if [ ! -f go.mod ]; then
@@ -83,7 +93,7 @@ jobs:
         go get github.com/gorilla/websocket@latest
         go mod tidy
 
-    # --- 关键新增步骤：强制安装 Windows 标准库 ---
+    # --- 强制安装 Windows 标准库 (确保 GOROOT 隔离) ---
     - name: Install Windows/AMD64 Standard Library with ECH patches
       run: |
         echo "Installing cross-compilation standard library for GOOS=windows, GOARCH=amd64..."
@@ -95,11 +105,11 @@ jobs:
         echo "Installation complete."
     # ---------------------------------------------------
     
-    - name: Build for Windows AMD64 with ECH
+    - name: Build for Windows AMD64 with ECH (Final Attempt)
       run: |
         mkdir -p ./release
         
-        # 关键修复：强制设置 GOROOT 和 GO_CMD
+        # 强制设置 GOROOT 和 GO_CMD
         export GOROOT="/tmp/cf-go"
         GO_CMD="$GOROOT/bin/go"
         
@@ -115,9 +125,10 @@ jobs:
         COMMIT_SHA=$(git rev-parse --short HEAD)
         LDFLAGS="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.CommitSHA=${COMMIT_SHA}"
         
-        # 强制使用 GOROOT 和 GO_CMD 进行构建
+        # 最终修复：强制禁用 GOCACHE，使用 GOROOT 和 GO_CMD 进行构建
         echo "Building for Windows AMD64 with ECH..."
-        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $GO_CMD build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-amd64.exe main.go
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 GOCACHE=off \
+          $GO_CMD build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-amd64.exe main.go
         
         chmod +x ./release/proxy-client-ech-*
         ls -lh ./release/
