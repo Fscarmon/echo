@@ -1,0 +1,65 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+  
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Add permission to create tags and releases
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0  # Get all history to ensure tags can be created correctly
+      
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+    
+    - name: Initialize Go module and get dependencies
+      run: |
+        go mod init nx-app
+        go get github.com/shirou/gopsutil/v3/mem@v3.24.5 
+        go get github.com/shirou/gopsutil/v3/process 
+        go get github.com/shirou/gopsutil/v3/cpu 
+        go get github.com/shirou/gopsutil/v3/host
+        go mod tidy
+    
+    - name: Build for multiple platforms with static linking
+      run: |
+        mkdir -p ./release
+        
+        # Build Linux AMD64 (static linking)
+        GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -extldflags=-static" -o ./release/linux-amd64-nx-app main.go
+        
+        # Build Linux ARM64 (static linking)
+        GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -extldflags=-static" -o ./release/linux-arm64-nx-app main.go
+        
+        # Build FreeBSD AMD64 (static linking)
+        GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -extldflags=-static" -o ./release/freebsd-amd64-nx-app main.go
+        
+        chmod +x ./release/*
+      
+    - name: Create Release
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        name: Release v${{ github.event.inputs.version }}
+        tag_name: v${{ github.event.inputs.version }}
+        draft: false
+        prerelease: false
+        files: |
+          ./release/linux-amd64-nx-app
+          ./release/linux-arm64-nx-app
+          ./release/freebsd-amd64-nx-app
