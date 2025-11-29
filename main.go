@@ -1,844 +1,793 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/binary"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// Config 配置结构
-type Config struct {
-	Port         string
-	VMMS         string
-	VMMPort      string
-	VMPath       string
-	VMPort       string
-	Xieyi        string
-	UUID         string
-	Youxuan      string
-	SubName      string
-	SubURL       string
-	Baohuo       string
-	NezhaServer  string
-	NezhaKey     string
-	NezhaPort    string
-	NezhaTLS     string
-	FilePath     string
-	Tok          string
-	HostName     string
-	AgentUUID    string
-	NezhaHasPort bool
-	VPort        string
+// ======================== 全局参数 ========================
 
-	// 下载链接
-	NezhaURLX64    string
-	NezhaURLARM64  string
-	NezhaURLBSD    string
-	NezhaURLX64Alt string
-	NezhaURLARM64Alt string
-	NezhaURLBSDAlt string
-	WebURLX64      string
-	WebURLARM64    string
-	WebURLBSD      string
-	CFFURLX64      string
-	CFFURLARM64    string
-	CFFURLBSD      string
-
-	// 文件名
-	WebFilename   string
-	NezhaFilename string
-	CFFFilename   string
-}
-
-// Global variables
 var (
-	config        Config
-	countryName   = "未知"
-	upURL         = ""
-	encodedURL    = ""
-	lastHostName  = ""
-	lastSentTime  int64
-	mu            sync.Mutex
+	listenAddr string
+	serverAddr string
+	serverIP   string
+	token      string
+	dnsServer  string
+	echDomain  string
+
+	echListMu sync.RWMutex
+	echList   []byte
 )
 
-// VmessConfig Vmess 配置结构
-type VmessConfig struct {
-	V    string `json:"v"`
-	PS   string `json:"ps"`
-	Add  string `json:"add"`
-	Port string `json:"port"`
-	ID   string `json:"id"`
-	Aid  string `json:"aid"`
-	Net  string `json:"net"`
-	Type string `json:"type"`
-	Host string `json:"host"`
-	Path string `json:"path"`
-	TLS  string `json:"tls"`
-	SNI  string `json:"sni"`
-	ALPN string `json:"alpn"`
+func init() {
+	flag.StringVar(&listenAddr, "l", "127.0.0.1:30000", "代理监听地址 (支持 SOCKS5 和 HTTP)")
+	flag.StringVar(&serverAddr, "f", "", "服务端地址 (格式: x.x.workers.dev:443)")
+	flag.StringVar(&serverIP, "ip", "", "指定服务端IP（绕过DNS解析）")
+	flag.StringVar(&token, "token", "", "身份验证令牌")
+	flag.StringVar(&dnsServer, "dns", "https://1.1.1.1/dns-query", "DNS服务器 (支持UDP和DoH格式)")
+	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH查询域名")
 }
 
 func main() {
-	// 初始化配置
-	initConfig()
+	flag.Parse()
 
-	// 打印信息
-	fmt.Println("==============================")
-	fmt.Println()
-	fmt.Println("     /info 系统信息")
-	fmt.Println("     /start 检查进程")
-	fmt.Printf("     /%s 订阅\n", config.UUID)
-	fmt.Println()
-	fmt.Println("==============================")
-
-	// 初始化下载
-	initializeDownloads(func() {
-		// 15秒后检查进程
-		time.AfterFunc(15*time.Second, func() {
-			checkProcesses()
-		})
-
-		// 20秒后初始化数据
-		time.AfterFunc(20*time.Second, func() {
-			initializeData()
-			if config.SubURL != "" {
-				startCronJob()
-			}
-		})
-
-		// 启动进程检查
-		startCheckingProcesses()
-
-		// 如果 nezha 有端口，执行 upname
-		if config.NezhaHasPort {
-			go upname()
-			ticker := time.NewTicker(1 * time.Minute)
-			go func() {
-				for range ticker.C {
-					upname()
-				}
-			}()
-		}
-	})
-
-	// 设置路由
-	setupRoutes()
-
-	// 启动服务器
-	fmt.Printf("nx-app listening on port %s!\n==============================\n", config.Port)
-	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
-		fmt.Printf("Server failed to start: %v\n", err)
+	if serverAddr == "" {
+		log.Fatal("必须指定服务端地址 -f\n\n示例:\n  ./client -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token")
 	}
+
+	log.Printf("[启动] 正在获取 ECH 配置...")
+	if err := prepareECH(); err != nil {
+		log.Fatalf("[启动] 获取 ECH 配置失败: %v", err)
+	}
+
+	runProxyServer(listenAddr)
 }
 
-// initConfig 初始化配置
-func initConfig() {
-	config.Port = getEnv("SERVER_PORT", getEnv("NX_PORT", "3000"))
-	config.VMMS = getEnv("VPATH", "vls-123456")
-	config.VMMPort = getEnv("VL_PORT", "8002")
-	config.VMPath = getEnv("MPATH", "vms-3456789")
-	config.VMPort = getEnv("VM_PORT", "8001")
-	config.Xieyi = getEnv("XIEYI", "vms")
-	config.UUID = getEnv("UUID", "3a8a1de5-7d41-45e2-88fe-0f538b822169")
-	config.Youxuan = getEnv("CF_IP", "ip.sb")
-	config.SubName = getEnv("SUB_NAME", "nx-app")
-	config.SubURL = getEnv("SUB_URL", "")
-	config.Baohuo = getEnv("BAOHUO_URL", "")
-	config.NezhaServer = getEnv("NSERVER", "")
-	config.NezhaKey = getEnv("NKEY", "")
-	config.NezhaPort = getEnv("NPORT", "443")
-	config.NezhaTLS = getEnv("NTLS", "--tls")
-	config.FilePath = getEnv("FILE_PATH", "/tmp/")
-	config.Tok = getEnv("TOK", "")
+// ======================== 工具函数 ========================
 
-	if config.Tok != "" {
-		config.HostName = getEnv("DOM", "")
-	}
-
-	config.NezhaHasPort = strings.Contains(config.NezhaServer, ":")
-
-	// 生成 AGENT_UUID
-	seed := config.SubName + config.UUID + config.NezhaServer + config.NezhaKey + config.Tok
-	hash := sha256.Sum256([]byte(seed))
-	hashStr := fmt.Sprintf("%x", hash)
-	agentUUID1 := fmt.Sprintf("%s-%s-%s-%s-%s",
-		hashStr[0:8], hashStr[8:12], hashStr[12:16], hashStr[16:20], hashStr[20:32])
-	config.AgentUUID = getEnv("AGENT_UUID", agentUUID1)
-
-	// 下载链接
-	config.NezhaURLX64 = getEnv("NEZHA_URL_X64", "https://github.com/Fscarmon/flies/releases/latest/download/agent-linux_amd64")
-	config.NezhaURLARM64 = getEnv("NEZHA_URL_ARM64", "https://github.com/Fscarmon/flies/releases/latest/download/agent-linux_arm64")
-	config.NezhaURLBSD = getEnv("NEZHA_URL_BSD", "https://github.com/Fscarmon/flies/releases/latest/download/agent-freebsd_amd64")
-	config.NezhaURLX64Alt = getEnv("NEZHA_URL_X64_ALT", "https://github.com/Fscarmon/flies/releases/latest/download/agent2-linux_amd64")
-	config.NezhaURLARM64Alt = getEnv("NEZHA_URL_ARM64_ALT", "https://github.com/Fscarmon/flies/releases/latest/download/agent2-linux_arm64")
-	config.NezhaURLBSDAlt = getEnv("NEZHA_URL_BSD_ALT", "https://github.com/Fscarmon/flies/releases/latest/download/agent2-freebsd_amd64")
-	config.WebURLX64 = getEnv("WEB_URL_X64", "https://github.com/dsadsadsss/1/releases/download/xry/kano-yuan")
-	config.WebURLARM64 = getEnv("WEB_URL_ARM64", "https://github.com/dsadsadsss/1/releases/download/xry/kano-yuan-arm")
-	config.WebURLBSD = getEnv("WEB_URL_BSD", "https://github.com/dsadsadsss/1/releases/download/xry/kano-bsd")
-	config.CFFURLX64 = getEnv("CFF_URL_X64", "https://github.com/Fscarmon/flies/releases/latest/download/cff-linux-amd64")
-	config.CFFURLARM64 = getEnv("CFF_URL_ARM64", "https://github.com/Fscarmon/flies/releases/latest/download/cff-linux-arm64")
-	config.CFFURLBSD = getEnv("CFF_URL_BSD", "https://github.com/dsadsadsss/1/releases/download/xry/argo-bsdamd")
-
-	// 文件名
-	config.WebFilename = getEnv("WEB_FILENAME", "webdav")
-	config.NezhaFilename = getEnv("NEZHA_FILENAME", "nexus")
-	config.CFFFilename = getEnv("CFF_FILENAME", "cfloat")
-
-	// VPort
-	if config.Xieyi == "vms" {
-		config.VPort = config.VMPort
-	} else {
-		config.VPort = config.VMMPort
-	}
-}
-
-// getEnv 获取环境变量
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-// getCountryName 获取国家名称
-func getCountryName() string {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("https://ip.xuexi365.eu.org")
-	if err != nil {
-		fmt.Printf("获取国家名称失败: %v\n", err)
-		return "未知"
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("请求失败，状态码: %d\n", resp.StatusCode)
-		return "未知"
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("读取响应内容失败: %v\n", err)
-		return "未知"
-	}
-
-	name := strings.TrimSpace(string(body))
-	if name == "" {
-		fmt.Println("获取的国家名称为空")
-		return "未知"
-	}
-
-	return name
-}
-
-// checkHostNameChange 检查主机名变化
-func checkHostNameChange(callback func()) {
-	if config.Tok == "" {
-		cmd := fmt.Sprintf(`grep -oE "https://.*[a-z]+cloudflare.com" %s/argo.log | tail -n 1 | sed "s#https://##"`, config.FilePath)
-		output, err := exec.Command("sh", "-c", cmd).Output()
-		if err != nil {
-			fmt.Printf("Error getting host_name: %v\n", err)
-			callback()
-			return
-		}
-
-		newHostName := strings.TrimSpace(string(output))
-		if newHostName != "" && newHostName != lastHostName {
-			fmt.Printf("host_name set to %s\n", newHostName)
-			mu.Lock()
-			config.HostName = newHostName
-			lastHostName = newHostName
-			mu.Unlock()
-			buildURLs()
-		}
-	}
-	callback()
-}
-
-// generateVmessLink 生成 Vmess 链接
-func generateVmessLink() string {
-	vmessConfig := VmessConfig{
-		V:    "2",
-		PS:   fmt.Sprintf("%s-%s", countryName, config.SubName),
-		Add:  config.Youxuan,
-		Port: "443",
-		ID:   config.UUID,
-		Aid:  "0",
-		Net:  "ws",
-		Type: "none",
-		Host: config.HostName,
-		Path: "/" + config.VMPath + "?ed=2048",
-		TLS:  "tls",
-		SNI:  config.HostName,
-		ALPN: "",
-	}
-
-	jsonBytes, _ := json.Marshal(vmessConfig)
-	return "vmess://" + base64.StdEncoding.EncodeToString(jsonBytes)
-}
-
-// buildURLs 构建 URL
-func buildURLs() {
-	mu.Lock()
-	defer mu.Unlock()
-
-	if config.Xieyi == "vms" {
-		upURL = generateVmessLink()
-		encodedURL = upURL
-	} else {
-		pass := "vless"
-		upURL = fmt.Sprintf("%s://%s@%s:443?path=%%2F%s%%3Fed%%3D2048&security=tls&encryption=none&host=%s&type=ws&sni=%s#%s-%s",
-			pass, config.UUID, config.Youxuan, config.VMMS, config.HostName, config.HostName, countryName, config.SubName)
-		encodedURL = base64.StdEncoding.EncodeToString([]byte(upURL))
-	}
-}
-
-// initializeData 初始化数据
-func initializeData() {
-	name := getCountryName()
-	if name != "" {
-		countryName = name
-		fmt.Printf("国家地区: %s\n", countryName)
-	} else {
-		fmt.Println("获取国家名称失败，使用默认值'未知'")
-		countryName = "UN"
-	}
-
-	checkHostNameChange(func() {
-		buildURLs()
-	})
-}
-
-// sendSubscription 发送订阅
-func sendSubscription() {
-	if config.SubURL == "" {
-		return
-	}
-
-	postData := map[string]string{
-		"URL_NAME": config.SubName,
-		"URL":      upURL,
-	}
-
-	jsonData, _ := json.Marshal(postData)
-	resp, err := http.Post(config.SubURL, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		fmt.Println("Sub Upload failed")
-		return
-	}
-	defer resp.Body.Close()
-
-	fmt.Println("Sub Upload successful")
-}
-
-// startCronJob 启动定时任务
-func startCronJob() {
-	if config.Tok == "" {
-		ticker := time.NewTicker(1 * time.Minute)
-		go func() {
-			for range ticker.C {
-				checkHostNameChange(func() {
-					now := time.Now().Unix()
-					if now-lastSentTime >= 5*60 {
-						sendSubscription()
-						lastSentTime = now
-					}
-				})
-			}
-		}()
-	} else {
-		buildURLs()
-		sendSubscription()
-		ticker := time.NewTicker(1 * time.Minute)
-		go func() {
-			for range ticker.C {
-				now := time.Now().Unix()
-				if now-lastSentTime >= 5*60 {
-					sendSubscription()
-					lastSentTime = now
-				}
-			}
-		}()
-	}
-}
-
-// checkProcessStatus 检查进程状态
-func checkProcessStatus(processName string) bool {
-	cmd := fmt.Sprintf(`ps aux | grep -E "%s" | grep -v "grep"`, processName)
-	output, err := exec.Command("sh", "-c", cmd).Output()
-	if err != nil || strings.TrimSpace(string(output)) == "" {
+func isNormalCloseError(err error) bool {
+	if err == nil {
 		return false
 	}
-	return true
-}
-
-// checkAndStartProcess 检查并启动进程
-func checkAndStartProcess(processName, startCommand string) {
-	if checkProcessStatus(processName) {
-		fmt.Printf("%s is already running\n", processName)
-		return
+	if err == io.EOF {
+		return true
 	}
-
-	cmd := exec.Command("sh", "-c", startCommand)
-	if err := cmd.Start(); err != nil {
-		fmt.Printf("Failed to start %s: %v\n", processName, err)
-	} else {
-		fmt.Printf("%s started successfully!\n", processName)
-	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "use of closed network connection") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "normal closure")
 }
 
-// checkProcesses 检查所有进程
-func checkProcesses() {
-	if config.NezhaServer != "" && config.NezhaKey != "" {
-		keepNezhaAlive()
-	}
-	keepCFFAlive()
-	keepWebAlive()
-}
+// ======================== ECH 支持 ========================
 
-// keepWebAlive 保持 Web 进程存活
-func keepWebAlive() {
-	processName := config.WebFilename
-	startCommand := fmt.Sprintf("MPATH=%s VM_PORT=%s VPATH=%s VL_PORT=%s UUID=%s nohup %s >/dev/null 2>&1 &",
-		config.VMPath, config.VMPort, config.VMMS, config.VMMPort, config.UUID,
-		filepath.Join(config.FilePath, config.WebFilename))
+const typeHTTPS = 65
 
-	checkAndStartProcess(processName, startCommand)
-
-	// 保活请求
-	if spaceHost := os.Getenv("SPACE_HOST"); spaceHost != "" {
-		exec.Command("curl", "-m5", "https://"+spaceHost).Run()
-	} else if config.Baohuo != "" {
-		exec.Command("curl", "-m5", "https://"+config.Baohuo).Run()
-	} else if projectDomain := os.Getenv("PROJECT_DOMAIN"); projectDomain != "" {
-		exec.Command("curl", "-m5", "https://"+projectDomain+".glitch.me").Run()
-	}
-}
-
-// keepNezhaAlive 保持 Nezha 进程存活
-func keepNezhaAlive() {
-	processName := config.NezhaFilename
-	var startCommand string
-
-	if config.NezhaHasPort {
-		startCommand = fmt.Sprintf("nohup %s -c %s >/dev/null 2>&1 &",
-			filepath.Join(config.FilePath, config.NezhaFilename),
-			filepath.Join(config.FilePath, "config.yml"))
-	} else {
-		startCommand = fmt.Sprintf("nohup %s -s %s:%s -p %s %s >/dev/null 2>&1 &",
-			filepath.Join(config.FilePath, config.NezhaFilename),
-			config.NezhaServer, config.NezhaPort, config.NezhaKey, config.NezhaTLS)
-	}
-
-	checkAndStartProcess(processName, startCommand)
-}
-
-// keepCFFAlive 保持 CFF 进程存活
-func keepCFFAlive() {
-	processName := config.CFFFilename
-	var startCommand string
-
-	if config.Tok != "" {
-		startCommand = fmt.Sprintf("nohup %s tunnel --edge-ip-version auto --protocol auto --no-autoupdate run --token %s >/dev/null 2>&1 &",
-			filepath.Join(config.FilePath, config.CFFFilename), config.Tok)
-	} else {
-		startCommand = fmt.Sprintf("nohup %s tunnel --edge-ip-version auto --protocol auto --url http://localhost:%s --no-autoupdate > %s/argo.log 2>&1 &",
-			filepath.Join(config.FilePath, config.CFFFilename), config.VPort, config.FilePath)
-	}
-
-	checkAndStartProcess(processName, startCommand)
-}
-
-// startCheckingProcesses 启动进程检查定时任务
-func startCheckingProcesses() {
-	ticker := time.NewTicker(1 * time.Minute)
-	go func() {
-		for range ticker.C {
-			checkProcesses()
-		}
-	}()
-}
-
-// downloadFile 下载文件
-func downloadFile(url, filepath string) error {
-	resp, err := http.Get(url)
+func prepareECH() error {
+	echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
 	if err != nil {
-		return err
+		return fmt.Errorf("DNS 查询失败: %w", err)
+	}
+	if echBase64 == "" {
+		return errors.New("未找到 ECH 参数")
+	}
+	raw, err := base64.StdEncoding.DecodeString(echBase64)
+	if err != nil {
+		return fmt.Errorf("ECH 解码失败: %w", err)
+	}
+	echListMu.Lock()
+	echList = raw
+	echListMu.Unlock()
+	log.Printf("[ECH] 配置已加载，长度: %d 字节", len(raw))
+	return nil
+}
+
+func refreshECH() error {
+	log.Printf("[ECH] 刷新配置...")
+	return prepareECH()
+}
+
+func getECHList() ([]byte, error) {
+	echListMu.RLock()
+	defer echListMu.RUnlock()
+	if len(echList) == 0 {
+		return nil, errors.New("ECH 配置未加载")
+	}
+	return echList, nil
+}
+
+func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("加载系统根证书失败: %w", err)
+	}
+	return &tls.Config{
+		MinVersion:                     tls.VersionTLS13,
+		ServerName:                     serverName,
+		EncryptedClientHelloConfigList: echList,
+		EncryptedClientHelloRejectionVerify: func(cs tls.ConnectionState) error {
+			return errors.New("服务器拒绝 ECH")
+		},
+		RootCAs: roots,
+	}, nil
+}
+
+// ======================== DNS 查询（支持UDP和DoH）========================
+
+func queryHTTPSRecord(domain, dnsServer string) (string, error) {
+	// 检查是否为DoH URL
+	if strings.HasPrefix(dnsServer, "https://") || strings.HasPrefix(dnsServer, "http://") {
+		return queryHTTPSRecordDoH(domain, dnsServer)
+	}
+	// 传统UDP DNS查询
+	return queryHTTPSRecordUDP(domain, dnsServer)
+}
+
+// DoH (DNS over HTTPS) 查询
+func queryHTTPSRecordDoH(domain, dohURL string) (string, error) {
+	query := buildDNSQuery(domain, typeHTTPS)
+	
+	// 构建DoH请求
+	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(query))
+	if err != nil {
+		return "", fmt.Errorf("创建DoH请求失败: %w", err)
+	}
+	
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("DoH请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-
-	out, err := os.Create(filepath)
-	if err != nil {
-		return err
+	
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("DoH响应错误: %d", resp.StatusCode)
 	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
+	
+	response, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("读取DoH响应失败: %w", err)
 	}
-
-	return os.Chmod(filepath, 0777)
+	
+	return parseDNSResponse(response)
 }
 
-// downloadWeb 下载 Web 文件
-func downloadWeb(callback func(error)) {
-	var webURL string
-	switch runtime.GOOS {
-	case "linux":
-		if runtime.GOARCH == "amd64" {
-			webURL = config.WebURLX64
-		} else if runtime.GOARCH == "arm64" {
-			webURL = config.WebURLARM64
-		}
-	case "freebsd":
-		webURL = config.WebURLBSD
-	default:
-		callback(fmt.Errorf("unsupported platform"))
-		return
+// 传统UDP DNS查询
+func queryHTTPSRecordUDP(domain, dnsServer string) (string, error) {
+	query := buildDNSQuery(domain, typeHTTPS)
+
+	conn, err := net.Dial("udp", dnsServer)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	if _, err = conn.Write(query); err != nil {
+		return "", err
 	}
 
-	err := downloadFile(webURL, filepath.Join(config.FilePath, config.WebFilename))
+	response := make([]byte, 4096)
+	n, err := conn.Read(response)
 	if err != nil {
-		fmt.Println("Download web failed")
-		callback(err)
-	} else {
-		fmt.Println("Download web successful")
-		callback(nil)
+		return "", err
 	}
+	return parseDNSResponse(response[:n])
 }
 
-// downloadNezha 下载 Nezha 文件
-func downloadNezha(callback func(error)) {
-	var nezhaURL string
-	switch runtime.GOOS {
-	case "linux":
-		if runtime.GOARCH == "amd64" {
-			if config.NezhaHasPort {
-				nezhaURL = config.NezhaURLX64Alt
-			} else {
-				nezhaURL = config.NezhaURLX64
-			}
-		} else if runtime.GOARCH == "arm64" {
-			if config.NezhaHasPort {
-				nezhaURL = config.NezhaURLARM64Alt
-			} else {
-				nezhaURL = config.NezhaURLARM64
-			}
+func buildDNSQuery(domain string, qtype uint16) []byte {
+	query := make([]byte, 0, 512)
+	query = append(query, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+	for _, label := range strings.Split(domain, ".") {
+		query = append(query, byte(len(label)))
+		query = append(query, []byte(label)...)
+	}
+	query = append(query, 0x00, byte(qtype>>8), byte(qtype), 0x00, 0x01)
+	return query
+}
+
+func parseDNSResponse(response []byte) (string, error) {
+	if len(response) < 12 {
+		return "", errors.New("响应过短")
+	}
+	ancount := binary.BigEndian.Uint16(response[6:8])
+	if ancount == 0 {
+		return "", errors.New("无应答记录")
+	}
+
+	offset := 12
+	for offset < len(response) && response[offset] != 0 {
+		offset += int(response[offset]) + 1
+	}
+	offset += 5
+
+	for i := 0; i < int(ancount); i++ {
+		if offset >= len(response) {
+			break
 		}
-	case "freebsd":
-		if config.NezhaHasPort {
-			nezhaURL = config.NezhaURLBSDAlt
+		if response[offset]&0xC0 == 0xC0 {
+			offset += 2
 		} else {
-			nezhaURL = config.NezhaURLBSD
-		}
-	default:
-		callback(fmt.Errorf("unsupported platform"))
-		return
-	}
-
-	err := downloadFile(nezhaURL, filepath.Join(config.FilePath, config.NezhaFilename))
-	if err != nil {
-		fmt.Println("Download nezha failed")
-		callback(err)
-	} else {
-		fmt.Println("Download nezha successful")
-		callback(nil)
-	}
-}
-
-// downloadCFF 下载 CFF 文件
-func downloadCFF(callback func(error)) {
-	var cffURL string
-	switch runtime.GOOS {
-	case "linux":
-		if runtime.GOARCH == "amd64" {
-			cffURL = config.CFFURLX64
-		} else if runtime.GOARCH == "arm64" {
-			cffURL = config.CFFURLARM64
-		}
-	case "freebsd":
-		cffURL = config.CFFURLBSD
-	default:
-		callback(fmt.Errorf("unsupported platform"))
-		return
-	}
-
-	err := downloadFile(cffURL, filepath.Join(config.FilePath, config.CFFFilename))
-	if err != nil {
-		fmt.Println("Download cff failed")
-		callback(err)
-	} else {
-		fmt.Println("Download cff successful")
-		callback(nil)
-	}
-}
-
-// createNezhaConfig 创建 Nezha 配置文件
-func createNezhaConfig(callback func(error)) {
-	if config.NezhaServer != "" && config.NezhaHasPort {
-		tlsBool := config.NezhaTLS == "--tls"
-		configContent := fmt.Sprintf(`client_secret: %s
-debug: false
-disable_auto_update: false
-disable_command_execute: false
-disable_force_update: false
-disable_nat: false
-disable_send_query: false
-gpu: false
-insecure_tls: true
-ip_report_period: 1800
-report_delay: 3
-server: %s
-skip_connection_count: false
-skip_procs_count: false
-temperature: false
-tls: %t
-use_gitee_to_upgrade: false
-use_ipv6_country_code: false
-uuid: %s`, config.NezhaKey, config.NezhaServer, tlsBool, config.AgentUUID)
-
-		err := os.WriteFile(filepath.Join(config.FilePath, "config.yml"), []byte(configContent), 0644)
-		if err != nil {
-			callback(fmt.Errorf("failed to create config.yml: %v", err))
-		} else {
-			fmt.Println("config.yml created successfully.")
-			callback(nil)
-		}
-	} else {
-		callback(nil)
-	}
-}
-
-// initializeDownloads 初始化下载
-func initializeDownloads(callback func()) {
-	var wg sync.WaitGroup
-	errorOccurred := false
-
-	tasksToComplete := 2
-	if config.NezhaServer != "" && config.NezhaKey != "" {
-		tasksToComplete++
-		if config.NezhaHasPort {
-			tasksToComplete++
-		}
-	}
-
-	wg.Add(tasksToComplete)
-
-	go func() {
-		downloadCFF(func(err error) {
-			if err != nil {
-				errorOccurred = true
+			for offset < len(response) && response[offset] != 0 {
+				offset += int(response[offset]) + 1
 			}
-			wg.Done()
-		})
-	}()
+			offset++
+		}
+		if offset+10 > len(response) {
+			break
+		}
+		rrType := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 8
+		dataLen := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 2
+		if offset+int(dataLen) > len(response) {
+			break
+		}
+		data := response[offset : offset+int(dataLen)]
+		offset += int(dataLen)
 
-	go func() {
-		downloadWeb(func(err error) {
-			if err != nil {
-				errorOccurred = true
+		if rrType == typeHTTPS {
+			if ech := parseHTTPSRecord(data); ech != "" {
+				return ech, nil
 			}
-			wg.Done()
-		})
-	}()
+		}
+	}
+	return "", nil
+}
 
-	if config.NezhaServer != "" && config.NezhaKey != "" {
-		go func() {
-			downloadNezha(func(err error) {
-				if err != nil {
-					errorOccurred = true
+func parseHTTPSRecord(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	offset := 2
+	if offset < len(data) && data[offset] == 0 {
+		offset++
+	} else {
+		for offset < len(data) && data[offset] != 0 {
+			offset += int(data[offset]) + 1
+		}
+		offset++
+	}
+	for offset+4 <= len(data) {
+		key := binary.BigEndian.Uint16(data[offset : offset+2])
+		length := binary.BigEndian.Uint16(data[offset+2 : offset+4])
+		offset += 4
+		if offset+int(length) > len(data) {
+			break
+		}
+		value := data[offset : offset+int(length)]
+		offset += int(length)
+		if key == 5 {
+			return base64.StdEncoding.EncodeToString(value)
+		}
+	}
+	return ""
+}
+
+// ======================== WebSocket 客户端 ========================
+
+func parseServerAddr(addr string) (host, port, path string, err error) {
+	path = "/"
+	slashIdx := strings.Index(addr, "/")
+	if slashIdx != -1 {
+		path = addr[slashIdx:]
+		addr = addr[:slashIdx]
+	}
+
+	host, port, err = net.SplitHostPort(addr)
+	if err != nil {
+		return "", "", "", fmt.Errorf("无效的服务器地址格式: %v", err)
+	}
+
+	return host, port, path, nil
+}
+
+func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
+	host, port, path, err := parseServerAddr(serverAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		echBytes, echErr := getECHList()
+		if echErr != nil {
+			if attempt < maxRetries {
+				refreshECH()
+				continue
+			}
+			return nil, echErr
+		}
+
+		tlsCfg, tlsErr := buildTLSConfigWithECH(host, echBytes)
+		if tlsErr != nil {
+			return nil, tlsErr
+		}
+
+		dialer := websocket.Dialer{
+			TLSClientConfig: tlsCfg,
+			Subprotocols: func() []string {
+				if token == "" {
+					return nil
 				}
-				wg.Done()
-			})
-		}()
-
-		if config.NezhaHasPort {
-			go func() {
-				createNezhaConfig(func(err error) {
-					if err != nil {
-						fmt.Println(err)
-						errorOccurred = true
-					}
-					wg.Done()
-				})
-			}()
+				return []string{token}
+			}(),
+			HandshakeTimeout: 10 * time.Second,
 		}
+
+		if serverIP != "" {
+			dialer.NetDial = func(network, address string) (net.Conn, error) {
+				_, port, err := net.SplitHostPort(address)
+				if err != nil {
+					return nil, err
+				}
+				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
+			}
+		}
+
+		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
+		if dialErr != nil {
+			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
+				log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries)
+				refreshECH()
+				time.Sleep(time.Second)
+				continue
+			}
+			return nil, dialErr
+		}
+
+		return wsConn, nil
 	}
 
-	wg.Wait()
-
-	if errorOccurred {
-		fmt.Println("Some downloads or config creation failed, but proceeding with startup.")
-	} else {
-		fmt.Println("All downloads and config creation successful!")
-	}
-
-	callback()
+	return nil, errors.New("连接失败，已达最大重试次数")
 }
 
-// upname 上传名称
-func upname() {
-	if config.AgentUUID == "" {
-		fmt.Println("错误: AGENT_UUID 环境变量未设置")
-		return
-	}
+// ======================== 统一代理服务器 ========================
 
-	if config.NezhaServer == "" || config.NezhaKey == "" {
-		return
-	}
-
-	nezURL := strings.TrimSuffix(config.NezhaServer, ":"+config.NezhaPort)
-	nezURL = strings.Split(nezURL, ":")[0]
-	url := fmt.Sprintf("https://%s/upload?token=%s", nezURL, config.NezhaKey)
-
-	postData := map[string]string{
-		"SUBNAME": config.SubName,
-		"UUID":    config.AgentUUID,
-	}
-
-	jsonData, _ := json.Marshal(postData)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+func runProxyServer(addr string) {
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		fmt.Printf("Error during upname POST request: %v\n", err)
-		return
+		log.Fatalf("[代理] 监听失败: %v", err)
 	}
-	defer resp.Body.Close()
+	defer listener.Close()
 
-	if resp.StatusCode == 200 || resp.StatusCode == 202 {
-		fmt.Println("upload sub_name succeeded")
+	log.Printf("[代理] 服务器启动: %s (支持 SOCKS5 和 HTTP)", addr)
+	log.Printf("[代理] 后端服务器: %s", serverAddr)
+	if serverIP != "" {
+		log.Printf("[代理] 使用固定 IP: %s", serverIP)
+	}
+	
+	// 显示DNS配置
+	if strings.HasPrefix(dnsServer, "https://") {
+		log.Printf("[DNS] 使用 DoH: %s", dnsServer)
 	} else {
-		fmt.Printf("upname failed with status: %d\n", resp.StatusCode)
+		log.Printf("[DNS] 使用 UDP: %s", dnsServer)
+	}
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("[代理] 接受连接失败: %v", err)
+			continue
+		}
+
+		go handleConnection(conn)
 	}
 }
 
-// setupRoutes 设置路由
-func setupRoutes() {
-	// 根路由
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+
+	clientAddr := conn.RemoteAddr().String()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return
+	}
+
+	firstByte := buf[0]
+
+	switch firstByte {
+	case 0x05:
+		handleSOCKS5(conn, clientAddr, firstByte)
+	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
+		handleHTTP(conn, clientAddr, firstByte)
+	default:
+		log.Printf("[代理] %s 未知协议: 0x%02x", clientAddr, firstByte)
+	}
+}
+
+// ======================== SOCKS5 处理 ========================
+
+func handleSOCKS5(conn net.Conn, clientAddr string, firstByte byte) {
+	if firstByte != 0x05 {
+		log.Printf("[SOCKS5] %s 版本错误: 0x%02x", clientAddr, firstByte)
+		return
+	}
+
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+
+	nmethods := buf[0]
+	methods := make([]byte, nmethods)
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return
+	}
+
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return
+	}
+
+	buf = make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+
+	if buf[0] != 5 {
+		return
+	}
+
+	command := buf[1]
+	atyp := buf[3]
+
+	var host string
+	switch atyp {
+	case 0x01:
+		buf = make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
 			return
 		}
-		fmt.Fprint(w, "hello world")
-	})
+		host = net.IP(buf).String()
 
-	// UUID 路由
-	http.HandleFunc("/"+config.UUID, func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, encodedURL)
-	})
-
-	// Start 路由
-	http.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
-		type ProcessStatus struct {
-			Process string  `json:"process"`
-			Status  string  `json:"status"`
-			Error   *string `json:"error,omitempty"`
+	case 0x03:
+		buf = make([]byte, 1)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
 		}
-
-		type Response struct {
-			Message   string          `json:"message"`
-			Processes []ProcessStatus `json:"processes"`
+		domainBuf := make([]byte, buf[0])
+		if _, err := io.ReadFull(conn, domainBuf); err != nil {
+			return
 		}
+		host = string(domainBuf)
 
-		processes := []struct {
-			Name         string
-			StartCommand string
-		}{
-			{
-				Name: config.CFFFilename,
-				StartCommand: func() string {
-					if config.Tok != "" {
-						return fmt.Sprintf("nohup %s tunnel --edge-ip-version auto --protocol auto run --no-autoupdate --token %s >/dev/null 2>&1 &",
-							filepath.Join(config.FilePath, config.CFFFilename), config.Tok)
-					}
-					return fmt.Sprintf("nohup %s tunnel --edge-ip-version auto --protocol auto --url http://localhost:%s --no-autoupdate > %s/argo.log 2>&1 &",
-						filepath.Join(config.FilePath, config.CFFFilename), config.VMMPort, config.FilePath)
-				}(),
-			},
-			{
-				Name: config.WebFilename,
-				StartCommand: fmt.Sprintf("MPATH=%s VM_PORT=%s VPATH=%s VL_PORT=%s UUID=%s nohup %s >/dev/null 2>&1 &",
-					config.VMPath, config.VMPort, config.VMMS, config.VMMPort, config.UUID,
-					filepath.Join(config.FilePath, config.WebFilename)),
-			},
+	case 0x04:
+		buf = make([]byte, 16)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
 		}
+		host = net.IP(buf).String()
 
-		if config.NezhaServer != "" && config.NezhaKey != "" {
-			var nezhaStartCommand string
-			if config.NezhaHasPort {
-				nezhaStartCommand = fmt.Sprintf("nohup %s -c %s >/dev/null 2>&1 &",
-					filepath.Join(config.FilePath, config.NezhaFilename),
-					filepath.Join(config.FilePath, "config.yml"))
-			} else {
-				nezhaStartCommand = fmt.Sprintf("nohup %s -s %s:%s -p %s %s >/dev/null 2>&1 &",
-					filepath.Join(config.FilePath, config.NezhaFilename),
-					config.NezhaServer, config.NezhaPort, config.NezhaKey, config.NezhaTLS)
+	default:
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
+
+	buf = make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+	port := int(buf[0])<<8 | int(buf[1])
+
+	var target string
+	if atyp == 0x04 {
+		target = fmt.Sprintf("[%s]:%d", host, port)
+	} else {
+		target = fmt.Sprintf("%s:%d", host, port)
+	}
+
+	if command != 0x01 {
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
+
+	log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
+
+	if err := handleTunnel(conn, target, clientAddr, modeSOCKS5, ""); err != nil {
+		if !isNormalCloseError(err) {
+			log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
+		}
+	}
+}
+
+// ======================== HTTP 处理 ========================
+
+func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
+	reader := bufio.NewReader(io.MultiReader(
+		strings.NewReader(string(firstByte)),
+		conn,
+	))
+
+	requestLine, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+
+	parts := strings.Fields(requestLine)
+	if len(parts) < 3 {
+		return
+	}
+
+	method := parts[0]
+	requestURL := parts[1]
+	httpVersion := parts[2]
+
+	headers := make(map[string]string)
+	var headerLines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		headerLines = append(headerLines, line)
+		if idx := strings.Index(line, ":"); idx > 0 {
+			key := strings.TrimSpace(line[:idx])
+			value := strings.TrimSpace(line[idx+1:])
+			headers[strings.ToLower(key)] = value
+		}
+	}
+
+	switch method {
+	case "CONNECT":
+		log.Printf("[HTTP-CONNECT] %s -> %s", clientAddr, requestURL)
+		if err := handleTunnel(conn, requestURL, clientAddr, modeHTTPConnect, ""); err != nil {
+			if !isNormalCloseError(err) {
+				log.Printf("[HTTP-CONNECT] %s 代理失败: %v", clientAddr, err)
 			}
-			processes = append(processes, struct {
-				Name         string
-				StartCommand string
-			}{Name: config.NezhaFilename, StartCommand: nezhaStartCommand})
 		}
 
-		var statuses []ProcessStatus
-		for _, proc := range processes {
-			if checkProcessStatus(proc.Name) {
-				statuses = append(statuses, ProcessStatus{
-					Process: proc.Name,
-					Status:  "Already running",
-				})
+	case "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE":
+		log.Printf("[HTTP-%s] %s -> %s", method, clientAddr, requestURL)
+
+		var target string
+		var path string
+
+		if strings.HasPrefix(requestURL, "http://") {
+			urlWithoutScheme := strings.TrimPrefix(requestURL, "http://")
+			idx := strings.Index(urlWithoutScheme, "/")
+			if idx > 0 {
+				target = urlWithoutScheme[:idx]
+				path = urlWithoutScheme[idx:]
 			} else {
-				cmd := exec.Command("sh", "-c", proc.StartCommand)
-				err := cmd.Start()
-				if err != nil {
-					errMsg := err.Error()
-					statuses = append(statuses, ProcessStatus{
-						Process: proc.Name,
-						Status:  "Failed to start",
-						Error:   &errMsg,
-					})
-				} else {
-					statuses = append(statuses, ProcessStatus{
-						Process: proc.Name,
-						Status:  "Started",
-					})
+				target = urlWithoutScheme
+				path = "/"
+			}
+		} else {
+			target = headers["host"]
+			path = requestURL
+		}
+
+		if target == "" {
+			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			return
+		}
+
+		if !strings.Contains(target, ":") {
+			target += ":80"
+		}
+
+		var requestBuilder strings.Builder
+		requestBuilder.WriteString(fmt.Sprintf("%s %s %s\r\n", method, path, httpVersion))
+
+		for _, line := range headerLines {
+			key := strings.Split(line, ":")[0]
+			keyLower := strings.ToLower(strings.TrimSpace(key))
+			if keyLower != "proxy-connection" && keyLower != "proxy-authorization" {
+				requestBuilder.WriteString(line)
+				requestBuilder.WriteString("\r\n")
+			}
+		}
+		requestBuilder.WriteString("\r\n")
+
+		if contentLength := headers["content-length"]; contentLength != "" {
+			var length int
+			fmt.Sscanf(contentLength, "%d", &length)
+			if length > 0 && length < 10*1024*1024 {
+				body := make([]byte, length)
+				if _, err := io.ReadFull(reader, body); err == nil {
+					requestBuilder.Write(body)
 				}
 			}
 		}
 
-		response := Response{
-			Message:   "Process check and start completed",
-			Processes: statuses,
+		firstFrame := requestBuilder.String()
+
+		if err := handleTunnel(conn, target, clientAddr, modeHTTPProxy, firstFrame); err != nil {
+			if !isNormalCloseError(err) {
+				log.Printf("[HTTP-%s] %s 代理失败: %v", method, clientAddr, err)
+			}
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	})
-
-	// 代理设置
-	setupProxy("/"+config.VMMS, "http://127.0.0.1:"+config.VMMPort)
-	setupProxy("/"+config.VMPath, "http://127.0.0.1:"+config.VMPort)
+	default:
+		log.Printf("[HTTP] %s 不支持的方法: %s", clientAddr, method)
+		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
+	}
 }
 
-// setupProxy 设置反向代理
-func setupProxy(path, target string) {
-	targetURL, _ := url.Parse(target)
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+// ======================== 通用隧道处理 ========================
 
-	http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-		proxy.ServeHTTP(w, r)
-	})
+const (
+	modeSOCKS5      = 1
+	modeHTTPConnect = 2
+	modeHTTPProxy   = 3
+)
+
+func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
+	wsConn, err := dialWebSocketWithECH(2)
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return err
+	}
+	defer wsConn.Close()
+
+	var mu sync.Mutex
+
+	stopPing := make(chan bool)
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				mu.Lock()
+				wsConn.WriteMessage(websocket.PingMessage, nil)
+				mu.Unlock()
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+	defer close(stopPing)
+
+	conn.SetDeadline(time.Time{})
+
+	if firstFrame == "" && mode == modeSOCKS5 {
+		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		buffer := make([]byte, 32768)
+		n, _ := conn.Read(buffer)
+		_ = conn.SetReadDeadline(time.Time{})
+		if n > 0 {
+			firstFrame = string(buffer[:n])
+		}
+	}
+
+	connectMsg := fmt.Sprintf("CONNECT:%s|%s", target, firstFrame)
+	mu.Lock()
+	err = wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg))
+	mu.Unlock()
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return err
+	}
+
+	_, msg, err := wsConn.ReadMessage()
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return err
+	}
+
+	response := string(msg)
+	if strings.HasPrefix(response, "ERROR:") {
+		sendErrorResponse(conn, mode)
+		return errors.New(response)
+	}
+	if response != "CONNECTED" {
+		sendErrorResponse(conn, mode)
+		return fmt.Errorf("意外响应: %s", response)
+	}
+
+	if err := sendSuccessResponse(conn, mode); err != nil {
+		return err
+	}
+
+	log.Printf("[代理] %s 已连接: %s", clientAddr, target)
+
+	done := make(chan bool, 2)
+
+	go func() {
+		buf := make([]byte, 32768)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				mu.Lock()
+				wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE"))
+				mu.Unlock()
+				done <- true
+				return
+			}
+
+			mu.Lock()
+			err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
+			mu.Unlock()
+			if err != nil {
+				done <- true
+				return
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			mt, msg, err := wsConn.ReadMessage()
+			if err != nil {
+				done <- true
+				return
+			}
+
+			if mt == websocket.TextMessage {
+				if string(msg) == "CLOSE" {
+					done <- true
+					return
+				}
+			}
+
+			if _, err := conn.Write(msg); err != nil {
+				done <- true
+				return
+			}
+		}
+	}()
+
+	<-done
+	log.Printf("[代理] %s 已断开: %s", clientAddr, target)
+	return nil
+}
+
+// ======================== 响应辅助函数 ========================
+
+func sendErrorResponse(conn net.Conn, mode int) {
+	switch mode {
+	case modeSOCKS5:
+		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	case modeHTTPConnect, modeHTTPProxy:
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+	}
+}
+
+func sendSuccessResponse(conn net.Conn, mode int) error {
+	switch mode {
+	case modeSOCKS5:
+		_, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return err
+	case modeHTTPConnect:
+		_, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		return err
+	case modeHTTPProxy:
+		return nil
+	}
+	return nil
 }
