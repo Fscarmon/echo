@@ -50,7 +50,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: /tmp/cf-go
-        key: cf-go-toolchain-${{ runner.os }}-v2 # 提升版本号以清除旧缓存
+        key: cf-go-toolchain-${{ runner.os }}-v2 # 提升版本号以清除旧的缓存数据
         restore-keys: |
           cf-go-toolchain-${{ runner.os }}-
     
@@ -97,7 +97,7 @@ jobs:
     
     - name: Initialize Go module and get dependencies
       run: |
-        # ECH Go 现在是唯一可用的 Go
+        # ECH Go 现在应该是唯一可用的 Go
         export PATH=/tmp/cf-go/bin:$PATH
         
         if [ ! -f go.mod ]; then
@@ -114,12 +114,12 @@ jobs:
         # 强制设置 GOROOT 和 PATH，确保使用 ECH-enabled Go
         export GOROOT="/tmp/cf-go"
         export PATH="$GOROOT/bin:$PATH"
-        # 使用 ECH 编译器安装标准库，解决 "unknown field" 问题
+        # 使用 ECH 编译器安装标准库
         GOOS=windows GOARCH=amd64 go install std
         echo "Installation complete."
     # ---------------------------------------------------
     
-    - name: Build for Windows AMD64 with ECH (Final Attempt)
+    - name: Build for Windows AMD64 with ECH (Final Working Attempt)
       run: |
         mkdir -p ./release
         
@@ -139,9 +139,9 @@ jobs:
         COMMIT_SHA=$(git rev-parse --short HEAD)
         LDFLAGS="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.CommitSHA=${COMMIT_SHA}"
         
-        # 最终修复：强制禁用 GOCACHE，使用 GOROOT 和 GO_CMD 进行构建
+        # 最终修复：使用隔离的 GOCACHE 目录，满足 Go 1.12+ 的要求
         echo "Building for Windows AMD64 with ECH..."
-        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 GOCACHE=off \
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 GOCACHE=./temp-go-cache \
           $GO_CMD build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-amd64.exe main.go
         
         chmod +x ./release/proxy-client-ech-*
