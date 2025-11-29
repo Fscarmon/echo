@@ -25,15 +25,6 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git build-essential
     
-    # --- 关键新增步骤：移除标准 Go ---
-    - name: Uninstall Standard Go from Tool Cache
-      run: |
-        echo "Attempting to forcefully remove standard Go installation to avoid PATH conflicts."
-        # 移除 GitHub Actions runner 托管工具缓存中的所有 Go 版本
-        sudo rm -rf /opt/hostedtoolcache/go
-        echo "Standard Go tool cache cleared."
-    # ------------------------------------
-    
     # --- 缓存 1: Go 模块和构建缓存 ---
     - name: Cache Go modules and build cache
       uses: actions/cache@v4
@@ -44,6 +35,14 @@ jobs:
         key: ${{ runner.os }}-go-mod-v1
         restore-keys: |
           ${{ runner.os }}-go-mod-
+    
+    # --- 关键新增步骤：设置 Go 引导环境 ---
+    - name: Set up Go 1.22 for Cloudflare Go Bootstrap
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+        cache: false # 临时引导环境，不缓存
+    # -----------------------------------
 
     # --- 缓存 2: Cloudflare Go 编译器 ---
     - name: Cache Cloudflare Go Toolchain
@@ -51,28 +50,43 @@ jobs:
       uses: actions/cache@v4
       with:
         path: /tmp/cf-go
-        key: cf-go-toolchain-${{ runner.os }}-v1
+        key: cf-go-toolchain-${{ runner.os }}-v2 # 提升版本号以清除旧缓存
         restore-keys: |
           cf-go-toolchain-${{ runner.os }}-
-
+    
     - name: Clone and build Cloudflare Go
       if: steps.cache-cf-go.outputs.cache-hit != 'true'
       run: |
         echo "Cache miss: Building Cloudflare Go from source..."
+        
+        # 修复引导错误：设置正确的引导路径
+        export GOROOT_BOOTSTRAP=$(go env GOROOT)
+        echo "Using GOROOT_BOOTSTRAP: $GOROOT_BOOTSTRAP"
+        
         git clone https://github.com/cloudflare/go.git /tmp/cf-go
         cd /tmp/cf-go
         git checkout cf
         cd src
+        # 使用引导路径进行编译
         ./make.bash
     
     - name: Verify Cloudflare Go
       run: |
         if [ ! -f "/tmp/cf-go/bin/go" ]; then
-          echo "Error: Cloudflare Go binary not found!"
+          echo "Error: Cloudflare Go binary not found! Build failed or cache issue."
           exit 1
         fi
         /tmp/cf-go/bin/go version
         echo "Cloudflare Go is ready."
+    
+    # --- 关键步骤：成功编译后，移除标准 Go 以隔离环境 ---
+    - name: Uninstall Standard Go from Tool Cache
+      run: |
+        echo "Successfully built ECH Go. Now removing standard Go to enforce environment isolation."
+        # 移除 GitHub Actions runner 托管工具缓存中的所有 Go 版本
+        sudo rm -rf /opt/hostedtoolcache/go
+        echo "Standard Go tool cache cleared."
+    # --------------------------------------------------------
     
     - name: Validate version format
       run: |
@@ -83,7 +97,7 @@ jobs:
     
     - name: Initialize Go module and get dependencies
       run: |
-        # 即使标准 Go 已被移除，我们仍然需要确保 PATH 正确指向 ECH Go
+        # ECH Go 现在是唯一可用的 Go
         export PATH=/tmp/cf-go/bin:$PATH
         
         if [ ! -f go.mod ]; then
