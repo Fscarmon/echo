@@ -50,7 +50,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: /tmp/cf-go
-        key: cf-go-toolchain-${{ runner.os }}-v2 # 确保清除旧缓存
+        key: cf-go-toolchain-${{ runner.os }}-v3 # 再次提升版本号以强制重建
         restore-keys: |
           cf-go-toolchain-${{ runner.os }}-
     
@@ -67,8 +67,17 @@ jobs:
         cd /tmp/cf-go
         git checkout cf
         cd src
-        # 使用引导路径进行编译
+        
+        # 1. 编译宿主工具链 (HOST BUILD)
+        echo "Starting Host (linux/amd64) Tools Build..."
         ./make.bash
+        
+        # 2. 关键修复：强制编译 Windows/AMD64 标准库 (CROSS-COMPILE)
+        # 这确保了 ECH 补丁被应用到目标平台的 crypto/tls 包
+        echo "Starting Cross-compile (windows/amd64) Standard Library Build..."
+        GOOS=windows GOARCH=amd64 ./make.bash
+        
+        echo "Cloudflare Go toolchain with Windows standard library is built."
     
     - name: Verify Cloudflare Go
       run: |
@@ -103,16 +112,6 @@ jobs:
         
         go get github.com/gorilla/websocket@latest
         go mod tidy
-
-    # --- 关键：强制安装 Windows 标准库 (包含 ECH 补丁) ---
-    - name: Install Windows/AMD64 Standard Library with ECH patches
-      run: |
-        echo "Installing cross-compilation standard library for GOOS=windows, GOARCH=amd64..."
-        export GOROOT="/tmp/cf-go"
-        export PATH="$GOROOT/bin:$PATH"
-        GOOS=windows GOARCH=amd64 go install std
-        echo "Installation complete."
-    # ---------------------------------------------------
     
     - name: Build for Windows AMD64 with ECH (Final Working Attempt)
       run: |
