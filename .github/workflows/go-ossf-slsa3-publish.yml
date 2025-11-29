@@ -31,8 +31,8 @@ jobs:
         git clone https://github.com/cloudflare/go.git /tmp/cf-go
         cd /tmp/cf-go
         
-        # 切换到支持 ECH 的分支
-        git checkout cf-go-1.22
+        # 切换到支持 ECH 的主分支 (cf)
+        git checkout cf
         
         # 构建 Go
         cd src
@@ -40,6 +40,7 @@ jobs:
         
         # 验证安装
         /tmp/cf-go/bin/go version
+        echo "Cloudflare Go with ECH support built successfully"
     
     - name: Validate version format
       run: |
