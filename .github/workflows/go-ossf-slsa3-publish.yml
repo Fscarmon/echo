@@ -42,32 +42,24 @@ jobs:
       uses: actions/cache@v4
       with:
         path: /tmp/cf-go
-        # Key 包含 OS 和手动版本号。如果 Cloudflare Go 更新，请修改 v1
         key: cf-go-toolchain-${{ runner.os }}-v1
         restore-keys: |
           cf-go-toolchain-${{ runner.os }}-
 
     - name: Clone and build Cloudflare Go
-      # 仅当没有缓存命中时才执行编译步骤
       if: steps.cache-cf-go.outputs.cache-hit != 'true'
       run: |
         echo "Cache miss: Building Cloudflare Go from source..."
-        # 克隆 Cloudflare Go 分支
         git clone https://github.com/cloudflare/go.git /tmp/cf-go
         cd /tmp/cf-go
-        
-        # 切换到支持 ECH 的主分支 (cf)
         git checkout cf
-        
-        # 构建 Go
         cd src
         ./make.bash
     
     - name: Verify Cloudflare Go
       run: |
-        # 无论是否命中缓存，都验证一下是否存在
         if [ ! -f "/tmp/cf-go/bin/go" ]; then
-          echo "Error: Cloudflare Go binary not found! Build failed or cache issue."
+          echo "Error: Cloudflare Go binary not found!"
           exit 1
         fi
         /tmp/cf-go/bin/go version
@@ -82,7 +74,6 @@ jobs:
     
     - name: Initialize Go module and get dependencies
       run: |
-        # 为 go mod tidy 设置 PATH，以便使用 ECH-enabled Go
         export PATH=/tmp/cf-go/bin:$PATH
         
         if [ ! -f go.mod ]; then
@@ -91,22 +82,33 @@ jobs:
         
         go get github.com/gorilla/websocket@latest
         go mod tidy
+
+    # --- 关键新增步骤：强制安装 Windows 标准库 ---
+    - name: Install Windows/AMD64 Standard Library with ECH patches
+      run: |
+        echo "Installing cross-compilation standard library for GOOS=windows, GOARCH=amd64..."
+        # 强制设置 GOROOT 和 PATH，确保使用 ECH-enabled Go
+        export GOROOT="/tmp/cf-go"
+        export PATH="$GOROOT/bin:$PATH"
+        # 使用 ECH 编译器安装标准库，解决 "unknown field" 问题
+        GOOS=windows GOARCH=amd64 go install std
+        echo "Installation complete."
+    # ---------------------------------------------------
     
     - name: Build for Windows AMD64 with ECH
       run: |
         mkdir -p ./release
         
-        # 关键修复：强制设置 Go 工具链的根目录
+        # 关键修复：强制设置 GOROOT 和 GO_CMD
         export GOROOT="/tmp/cf-go"
         GO_CMD="$GOROOT/bin/go"
         
-        # --- 诊断步骤 (用于验证是否使用了正确的编译器) ---
+        # --- 诊断步骤 ---
         echo "--- Diagnostic Check ---"
         echo "Cloudflare GOROOT: $GOROOT"
         echo "Cloudflare Go Path: $GO_CMD"
         $GO_CMD version
         echo "--- Starting Windows AMD64 Build ---"
-        # --- 诊断步骤结束 ---
         
         VERSION="${{ github.event.inputs.version }}"
         BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -129,7 +131,6 @@ jobs:
     - name: Create compressed archives
       run: |
         cd ./release
-        # 仅打包 Windows 版本
         zip proxy-client-ech-windows-amd64.zip proxy-client-ech-windows-amd64.exe
         
         ls -lh *.zip
@@ -141,11 +142,6 @@ jobs:
         
         ### 🔒 特性
         此版本使用 **Cloudflare Go** 编译，**完整支持 ECH (Encrypted Client Hello)**。
-        
-        ECH 功能提供：
-        - ✅ 加密 TLS 握手中的 SNI (服务器名称指示)
-        - ✅ 防止中间人监测访问的域名
-        - ✅ 增强隐私保护
         
         ### 构建信息
         - **提交版本**: \`$(git rev-parse --short HEAD)\`
@@ -168,17 +164,6 @@ jobs:
           -dns https://1.1.1.1/dns-query `
           -ech cloudflare-ech.com
         \`\`\`
-        
-        ### 验证 ECH 是否工作
-        运行程序后，你应该看到类似的日志：
-        \`\`\`
-        [ECH] 配置已加载，长度: 123 字节
-        [代理] 服务器启动: 127.0.0.1:1080
-        \`\`\`
-        
-        ---
-        
-        💡 **提示**: 如果不需要 ECH 功能，可以使用标准版本以获得更小的二进制体积。
         EOF
         
         cat release_notes.md
