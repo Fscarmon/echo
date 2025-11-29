@@ -25,8 +25,33 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git build-essential
     
+    # --- 缓存 1: Go 模块和构建缓存 ---
+    - name: Cache Go modules and build cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: ${{ runner.os }}-go-mod-v1
+        restore-keys: |
+          ${{ runner.os }}-go-mod-
+
+    # --- 缓存 2: Cloudflare Go 编译器 ---
+    - name: Cache Cloudflare Go Toolchain
+      id: cache-cf-go
+      uses: actions/cache@v4
+      with:
+        path: /tmp/cf-go
+        # Key 包含 OS 和手动版本号。如果 Cloudflare Go 更新，请修改 v1
+        key: cf-go-toolchain-${{ runner.os }}-v1
+        restore-keys: |
+          cf-go-toolchain-${{ runner.os }}-
+
     - name: Clone and build Cloudflare Go
+      # 仅当没有缓存命中时才执行编译步骤
+      if: steps.cache-cf-go.outputs.cache-hit != 'true'
       run: |
+        echo "Cache miss: Building Cloudflare Go from source..."
         # 克隆 Cloudflare Go 分支
         git clone https://github.com/cloudflare/go.git /tmp/cf-go
         cd /tmp/cf-go
@@ -37,10 +62,16 @@ jobs:
         # 构建 Go
         cd src
         ./make.bash
-        
-        # 验证安装
+    
+    - name: Verify Cloudflare Go
+      run: |
+        # 无论是否命中缓存，都验证一下是否存在
+        if [ ! -f "/tmp/cf-go/bin/go" ]; then
+          echo "Error: Cloudflare Go binary not found! Build failed or cache issue."
+          exit 1
+        fi
         /tmp/cf-go/bin/go version
-        echo "Cloudflare Go with ECH support built successfully"
+        echo "Cloudflare Go is ready."
     
     - name: Validate version format
       run: |
@@ -51,7 +82,7 @@ jobs:
     
     - name: Initialize Go module and get dependencies
       run: |
-        # 为了 go mod 操作临时设置 PATH，但在构建时我们会使用绝对路径以防万一
+        # 为 go mod tidy 设置 PATH，以便使用 ECH-enabled Go
         export PATH=/tmp/cf-go/bin:$PATH
         
         if [ ! -f go.mod ]; then
@@ -65,17 +96,26 @@ jobs:
       run: |
         mkdir -p ./release
         
-        # 关键修复：显式定义使用刚构建的支持 ECH 的 Go 编译器
-        GO_CMD="/tmp/cf-go/bin/go"
+        # 关键修复：强制设置 Go 工具链的根目录
+        export GOROOT="/tmp/cf-go"
+        GO_CMD="$GOROOT/bin/go"
+        
+        # --- 诊断步骤 (用于验证是否使用了正确的编译器) ---
+        echo "--- Diagnostic Check ---"
+        echo "Cloudflare GOROOT: $GOROOT"
+        echo "Cloudflare Go Path: $GO_CMD"
+        $GO_CMD version
+        echo "--- Starting Windows AMD64 Build ---"
+        # --- 诊断步骤结束 ---
         
         VERSION="${{ github.event.inputs.version }}"
         BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
         COMMIT_SHA=$(git rev-parse --short HEAD)
         LDFLAGS="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.CommitSHA=${COMMIT_SHA}"
         
-        # Windows AMD64
+        # 强制使用 GOROOT 和 GO_CMD 进行构建
         echo "Building for Windows AMD64 with ECH..."
-        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 ${GO_CMD} build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-amd64.exe main.go
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $GO_CMD build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-amd64.exe main.go
         
         chmod +x ./release/proxy-client-ech-*
         ls -lh ./release/
@@ -119,13 +159,13 @@ jobs:
         
         ### 使用说明
         
-        \`\`\`bash
-        # 示例：启动代理（自动使用 ECH）
-        proxy-client-ech-windows-amd64.exe ^
-          -l 127.0.0.1:1080 ^
-          -f your-worker.workers.dev:443 ^
-          -token your-token ^
-          -dns https://1.1.1.1/dns-query ^
+        \`\`\`powershell
+        # 示例：启动代理（Windows）
+        .\proxy-client-ech-windows-amd64.exe `
+          -l 127.0.0.1:1080 `
+          -f your-worker.workers.dev:443 `
+          -token your-token `
+          -dns https://1.1.1.1/dns-query `
           -ech cloudflare-ech.com
         \`\`\`
         
