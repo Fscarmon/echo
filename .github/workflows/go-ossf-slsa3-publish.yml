@@ -1,12 +1,13 @@
-name: Build and Release
+name: Build and Release (ECH Support)
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version number (e.g. 1.0.0)'
+        description: 'Version number (e.g. 1.0.0-ech)'
         required: true
-        default: '1.0.0'
-  
+        default: '1.0.0-ech'
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,55 +19,78 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-      
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
-        cache: true
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git build-essential
+    
+    - name: Clone and build Cloudflare Go
+      run: |
+        # 克隆 Cloudflare Go 分支
+        git clone https://github.com/cloudflare/go.git /tmp/cf-go
+        cd /tmp/cf-go
+        
+        # 切换到支持 ECH 的分支
+        git checkout cf-go-1.22
+        
+        # 构建 Go
+        cd src
+        ./make.bash
+        
+        # 验证安装
+        /tmp/cf-go/bin/go version
     
     - name: Validate version format
       run: |
-        if ! [[ "${{ github.event.inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "Error: Version must be in format X.Y.Z"
-          exit 1
-        fi
-    
-    - name: Check if tag already exists
-      run: |
-        if git rev-parse "v${{ github.event.inputs.version }}" >/dev/null 2>&1; then
-          echo "Error: Tag v${{ github.event.inputs.version }} already exists"
+        if ! [[ "${{ github.event.inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-ech)?$ ]]; then
+          echo "Error: Version must be in format X.Y.Z or X.Y.Z-ech"
           exit 1
         fi
     
     - name: Initialize Go module and get dependencies
       run: |
-        go mod init nx-app || true
-        go get github.com/shirou/gopsutil/v3/mem@v3.24.5 
-        go get github.com/shirou/gopsutil/v3/process 
-        go get github.com/shirou/gopsutil/v3/cpu 
-        go get github.com/shirou/gopsutil/v3/host
+        export PATH=/tmp/cf-go/bin:$PATH
+        
+        if [ ! -f go.mod ]; then
+          go mod init proxy-client
+        fi
+        
+        go get github.com/gorilla/websocket@latest
         go mod tidy
     
-    - name: Run tests
-      run: go test ./... -v
-      continue-on-error: false
-    
-    - name: Build for multiple platforms with static linking
+    - name: Build for multiple platforms with ECH
       run: |
         mkdir -p ./release
+        export PATH=/tmp/cf-go/bin:$PATH
         
-        # Define version and build info
         VERSION="${{ github.event.inputs.version }}"
         BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
         COMMIT_SHA=$(git rev-parse --short HEAD)
-        LDFLAGS="-s -w -extldflags=-static -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.CommitSHA=${COMMIT_SHA}"
+        LDFLAGS="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.CommitSHA=${COMMIT_SHA}"
         
-        # Build Windows AMD64
-        echo "Building for Windows AMD64..."
-        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/nx-app-windows-amd64.exe main.go
+        # Windows AMD64
+        echo "Building for Windows AMD64 with ECH..."
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-amd64.exe main.go
         
-        chmod +x ./release/*
+        # Linux AMD64
+        echo "Building for Linux AMD64 with ECH..."
+        GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-linux-amd64 main.go
+        
+        # Linux ARM64
+        echo "Building for Linux ARM64 with ECH..."
+        GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-linux-arm64 main.go
+        
+        # macOS AMD64
+        echo "Building for macOS AMD64 with ECH..."
+        GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-darwin-amd64 main.go
+        
+        # macOS ARM64
+        echo "Building for macOS ARM64 with ECH..."
+        GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-darwin-arm64 main.go
+        
+        chmod +x ./release/proxy-client-ech-*
+        ls -lh ./release/
     
     - name: Generate checksums
       run: |
@@ -77,40 +101,72 @@ jobs:
     - name: Create compressed archives
       run: |
         cd ./release
-        # Create zip archive for Windows
-        zip nx-app-windows-amd64.zip nx-app-windows-amd64.exe
-        ls -lh
+        
+        zip proxy-client-ech-windows-amd64.zip proxy-client-ech-windows-amd64.exe
+        tar -czf proxy-client-ech-linux-amd64.tar.gz proxy-client-ech-linux-amd64
+        tar -czf proxy-client-ech-linux-arm64.tar.gz proxy-client-ech-linux-arm64
+        tar -czf proxy-client-ech-darwin-amd64.tar.gz proxy-client-ech-darwin-amd64
+        tar -czf proxy-client-ech-darwin-arm64.tar.gz proxy-client-ech-darwin-arm64
+        
+        ls -lh *.zip *.tar.gz
     
     - name: Generate release notes
-      id: release_notes
       run: |
         cat << EOF > release_notes.md
-        ## Release v${{ github.event.inputs.version }}
+        ## Release v${{ github.event.inputs.version }} ✨ ECH 支持版本
         
-        ### Changes
-        - Built from commit: \`$(git rev-parse --short HEAD)\`
-        - Build date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        ### 🔒 特性
+        此版本使用 **Cloudflare Go** 编译，**完整支持 ECH (Encrypted Client Hello)**。
         
-        ### Downloads
-        Choose the appropriate binary for your platform:
-        - **Windows AMD64**: \`nx-app-windows-amd64.zip\`
+        ECH 功能提供：
+        - ✅ 加密 TLS 握手中的 SNI (服务器名称指示)
+        - ✅ 防止中间人监测访问的域名
+        - ✅ 增强隐私保护
         
-        ### Installation
+        ### 构建信息
+        - **提交版本**: \`$(git rev-parse --short HEAD)\`
+        - **构建时间**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        - **Go 版本**: Cloudflare Go 1.22 (ECH enabled)
+        
+        ### 下载
         
         #### Windows
-        \`\`\`powershell
-        # Download and extract
-        Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/nx-app-windows-amd64.zip" -OutFile "nx-app-windows-amd64.zip"
-        Expand-Archive -Path nx-app-windows-amd64.zip -DestinationPath .
+        - **AMD64**: \`proxy-client-ech-windows-amd64.zip\`
         
-        # Run the application
-        .\nx-app-windows-amd64.exe
-        \`\`\`
+        #### Linux
+        - **AMD64**: \`proxy-client-ech-linux-amd64.tar.gz\`
+        - **ARM64**: \`proxy-client-ech-linux-arm64.tar.gz\`
         
-        ### Verify checksums
+        #### macOS
+        - **Intel**: \`proxy-client-ech-darwin-amd64.tar.gz\`
+        - **Apple Silicon**: \`proxy-client-ech-darwin-arm64.tar.gz\`
+        
+        ### 使用说明
+        
         \`\`\`bash
-        sha256sum -c checksums.txt
+        # 示例：启动代理（自动使用 ECH）
+        ./proxy-client-ech-linux-amd64 \\
+          -l 127.0.0.1:1080 \\
+          -f your-worker.workers.dev:443 \\
+          -token your-token \\
+          -dns https://1.1.1.1/dns-query \\
+          -ech cloudflare-ech.com
         \`\`\`
+        
+        ### 验证 ECH 是否工作
+        运行程序后，你应该看到类似的日志：
+        \`\`\`
+        [ECH] 配置已加载，长度: 123 字节
+        [代理] 服务器启动: 127.0.0.1:1080
+        \`\`\`
+        
+        ### 参数说明
+        - \`-ech\`: ECH 配置查询域名（默认: cloudflare-ech.com）
+        - \`-dns\`: DNS 服务器，建议使用 DoH（默认: https://1.1.1.1/dns-query）
+        
+        ---
+        
+        💡 **提示**: 如果不需要 ECH 功能，可以使用标准版本以获得更小的二进制体积。
         EOF
         
         cat release_notes.md
@@ -120,19 +176,20 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        name: Release v${{ github.event.inputs.version }}
+        name: Release v${{ github.event.inputs.version }} (ECH Support)
         tag_name: v${{ github.event.inputs.version }}
         body_path: release_notes.md
         draft: false
         prerelease: false
         files: |
           ./release/*.zip
+          ./release/*.tar.gz
           ./release/checksums.txt
-        make_latest: true
+        make_latest: false
     
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: binaries-v${{ github.event.inputs.version }}
+        name: binaries-ech-v${{ github.event.inputs.version }}
         path: ./release/
         retention-days: 30
