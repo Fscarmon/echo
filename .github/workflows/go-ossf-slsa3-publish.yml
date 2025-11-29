@@ -7,10 +7,6 @@ on:
         description: 'Version number (e.g. 1.0.0-ech)'
         required: true
         default: '1.0.0-ech'
-      source_file:
-        description: 'Source file to build'
-        required: false
-        default: 'ech-workers.go'
 
 jobs:
   build:
@@ -31,20 +27,20 @@ jobs:
     
     - name: Clone and build Cloudflare Go
       run: |
-        echo "Cloning Cloudflare Go repository..."
-        git clone --depth 1 https://github.com/cloudflare/go.git /tmp/cf-go
+        # 克隆 Cloudflare Go 分支
+        git clone https://github.com/cloudflare/go.git /tmp/cf-go
         cd /tmp/cf-go
         
-        echo "Checking out cf branch..."
+        # 切换到支持 ECH 的主分支 (cf)
         git checkout cf
         
-        echo "Building Cloudflare Go..."
+        # 构建 Go
         cd src
         ./make.bash
         
-        echo "Verifying Cloudflare Go installation..."
+        # 验证安装
         /tmp/cf-go/bin/go version
-        echo "✅ Cloudflare Go with ECH support built successfully"
+        echo "Cloudflare Go with ECH support built successfully"
     
     - name: Validate version format
       run: |
@@ -55,271 +51,94 @@ jobs:
     
     - name: Initialize Go module and get dependencies
       run: |
-        # 设置环境变量使用 Cloudflare Go
+        # 为了 go mod 操作临时设置 PATH，但在构建时我们会使用绝对路径以防万一
         export PATH=/tmp/cf-go/bin:$PATH
-        export GOROOT=/tmp/cf-go
         
-        echo "Using Go version:"
-        go version
-        echo "Go location:"
-        which go
-        
-        # 初始化模块
         if [ ! -f go.mod ]; then
           go mod init proxy-client
         fi
         
-        # 安装依赖
         go get github.com/gorilla/websocket@latest
         go mod tidy
-        
-        echo "✅ Dependencies installed"
     
-    - name: Verify source file
-      run: |
-        SOURCE_FILE="${{ github.event.inputs.source_file }}"
-        if [ ! -f "$SOURCE_FILE" ]; then
-          echo "❌ Error: Source file '$SOURCE_FILE' not found"
-          echo "Available .go files:"
-          ls -la *.go
-          exit 1
-        fi
-        echo "✅ Source file found: $SOURCE_FILE"
-    
-    - name: Build for multiple platforms with ECH
+    - name: Build for Windows AMD64 with ECH
       run: |
         mkdir -p ./release
         
-        # 设置环境变量使用 Cloudflare Go
-        export PATH=/tmp/cf-go/bin:$PATH
-        export GOROOT=/tmp/cf-go
+        # 关键修复：显式定义使用刚构建的支持 ECH 的 Go 编译器
+        GO_CMD="/tmp/cf-go/bin/go"
         
-        SOURCE_FILE="${{ github.event.inputs.source_file }}"
         VERSION="${{ github.event.inputs.version }}"
         BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
         COMMIT_SHA=$(git rev-parse --short HEAD)
         LDFLAGS="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X main.CommitSHA=${COMMIT_SHA}"
         
-        echo "============================================"
-        echo "Building with ECH support"
-        echo "Go version: $(go version)"
-        echo "Source file: $SOURCE_FILE"
-        echo "Version: $VERSION"
-        echo "============================================"
-        
         # Windows AMD64
-        echo ""
-        echo "📦 Building for Windows AMD64..."
-        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-amd64.exe "$SOURCE_FILE"
-        echo "✅ Windows AMD64 build complete"
+        echo "Building for Windows AMD64 with ECH..."
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 ${GO_CMD} build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-amd64.exe main.go
         
-        # Windows ARM64
-        echo ""
-        echo "📦 Building for Windows ARM64..."
-        GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-windows-arm64.exe "$SOURCE_FILE"
-        echo "✅ Windows ARM64 build complete"
-        
-        # Linux AMD64
-        echo ""
-        echo "📦 Building for Linux AMD64..."
-        GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-linux-amd64 "$SOURCE_FILE"
-        echo "✅ Linux AMD64 build complete"
-        
-        # Linux ARM64
-        echo ""
-        echo "📦 Building for Linux ARM64..."
-        GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-linux-arm64 "$SOURCE_FILE"
-        echo "✅ Linux ARM64 build complete"
-        
-        # macOS AMD64
-        echo ""
-        echo "📦 Building for macOS AMD64..."
-        GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-darwin-amd64 "$SOURCE_FILE"
-        echo "✅ macOS AMD64 build complete"
-        
-        # macOS ARM64
-        echo ""
-        echo "📦 Building for macOS ARM64..."
-        GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o ./release/proxy-client-ech-darwin-arm64 "$SOURCE_FILE"
-        echo "✅ macOS ARM64 build complete"
-        
-        # 设置执行权限
         chmod +x ./release/proxy-client-ech-*
-        
-        echo ""
-        echo "============================================"
-        echo "📊 Build Summary:"
         ls -lh ./release/
-        echo "============================================"
     
     - name: Generate checksums
       run: |
         cd ./release
         sha256sum * > checksums.txt
-        echo "📝 Checksums:"
         cat checksums.txt
     
     - name: Create compressed archives
       run: |
         cd ./release
-        
-        echo "📦 Creating compressed archives..."
-        
-        # Windows
+        # 仅打包 Windows 版本
         zip proxy-client-ech-windows-amd64.zip proxy-client-ech-windows-amd64.exe
-        zip proxy-client-ech-windows-arm64.zip proxy-client-ech-windows-arm64.exe
         
-        # Linux
-        tar -czf proxy-client-ech-linux-amd64.tar.gz proxy-client-ech-linux-amd64
-        tar -czf proxy-client-ech-linux-arm64.tar.gz proxy-client-ech-linux-arm64
-        
-        # macOS
-        tar -czf proxy-client-ech-darwin-amd64.tar.gz proxy-client-ech-darwin-amd64
-        tar -czf proxy-client-ech-darwin-arm64.tar.gz proxy-client-ech-darwin-arm64
-        
-        echo ""
-        echo "✅ Archives created:"
-        ls -lh *.zip *.tar.gz
+        ls -lh *.zip
     
     - name: Generate release notes
       run: |
-        cat << 'EOF' > release_notes.md
-        ## 🔒 Release v${{ github.event.inputs.version }} - ECH 支持版本
+        cat << EOF > release_notes.md
+        ## Release v${{ github.event.inputs.version }} ✨ ECH 支持版本
         
-        ### ✨ 特性
+        ### 🔒 特性
+        此版本使用 **Cloudflare Go** 编译，**完整支持 ECH (Encrypted Client Hello)**。
         
-        此版本使用 **Cloudflare Go (cf branch)** 编译，**完整支持 ECH (Encrypted Client Hello)**。
-        
-        **ECH 功能优势：**
+        ECH 功能提供：
         - ✅ 加密 TLS 握手中的 SNI (服务器名称指示)
         - ✅ 防止中间人监测访问的域名
-        - ✅ 提供更强的隐私保护
-        - ✅ 绕过基于 SNI 的审查和封锁
+        - ✅ 增强隐私保护
         
-        ### 📋 构建信息
+        ### 构建信息
+        - **提交版本**: \`$(git rev-parse --short HEAD)\`
+        - **构建时间**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        - **Go 版本**: Cloudflare Go (ECH enabled)
         
-        | 项目 | 值 |
-        |------|-----|
-        | **版本** | v${{ github.event.inputs.version }} |
-        | **提交** | `$(git rev-parse --short HEAD)` |
-        | **构建时间** | $(date -u +"%Y-%m-%d %H:%M:%S UTC") |
-        | **Go 版本** | Cloudflare Go (cf branch) |
-        | **ECH 支持** | ✅ 是 |
-        
-        ### 📥 下载
-        
-        根据你的操作系统选择对应的版本：
+        ### 下载
         
         #### Windows
-        - **AMD64 (64位)**: [`proxy-client-ech-windows-amd64.zip`](https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-windows-amd64.zip)
-        - **ARM64**: [`proxy-client-ech-windows-arm64.zip`](https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-windows-arm64.zip)
+        - **AMD64**: \`proxy-client-ech-windows-amd64.zip\`
         
-        #### Linux
-        - **AMD64 (64位)**: [`proxy-client-ech-linux-amd64.tar.gz`](https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-linux-amd64.tar.gz)
-        - **ARM64**: [`proxy-client-ech-linux-arm64.tar.gz`](https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-linux-arm64.tar.gz)
+        ### 使用说明
         
-        #### macOS
-        - **Intel (AMD64)**: [`proxy-client-ech-darwin-amd64.tar.gz`](https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-darwin-amd64.tar.gz)
-        - **Apple Silicon (ARM64)**: [`proxy-client-ech-darwin-arm64.tar.gz`](https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-darwin-arm64.tar.gz)
+        \`\`\`bash
+        # 示例：启动代理（自动使用 ECH）
+        proxy-client-ech-windows-amd64.exe ^
+          -l 127.0.0.1:1080 ^
+          -f your-worker.workers.dev:443 ^
+          -token your-token ^
+          -dns https://1.1.1.1/dns-query ^
+          -ech cloudflare-ech.com
+        \`\`\`
         
-        ### 🚀 快速开始
-        
-        #### Windows
-        ```powershell
-        # 下载并解压
-        Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-windows-amd64.zip" -OutFile "proxy-client-ech.zip"
-        Expand-Archive -Path proxy-client-ech.zip -DestinationPath .
-        
-        # 运行（自动启用 ECH）
-        .\proxy-client-ech-windows-amd64.exe -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token
-        ```
-        
-        #### Linux
-        ```bash
-        # 下载并解压
-        wget https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-linux-amd64.tar.gz
-        tar -xzf proxy-client-ech-linux-amd64.tar.gz
-        chmod +x proxy-client-ech-linux-amd64
-        
-        # 运行
-        ./proxy-client-ech-linux-amd64 -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token
-        ```
-        
-        #### macOS
-        ```bash
-        # Intel Mac
-        wget https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-darwin-amd64.tar.gz
-        tar -xzf proxy-client-ech-darwin-amd64.tar.gz
-        chmod +x proxy-client-ech-darwin-amd64
-        ./proxy-client-ech-darwin-amd64 -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token
-        
-        # Apple Silicon Mac
-        wget https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/proxy-client-ech-darwin-arm64.tar.gz
-        tar -xzf proxy-client-ech-darwin-arm64.tar.gz
-        chmod +x proxy-client-ech-darwin-arm64
-        ./proxy-client-ech-darwin-arm64 -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token
-        ```
-        
-        ### ⚙️ 参数说明
-        
-        ```
-        -l      代理监听地址 (默认: 127.0.0.1:30000)
-        -f      服务端地址 (必需，格式: your-worker.workers.dev:443)
-        -ip     指定服务端IP（绕过DNS解析）
-        -token  身份验证令牌
-        -dns    DNS服务器 (默认: 119.29.29.29:53)
-        -ech    ECH查询域名 (默认: cloudflare-ech.com)
-        ```
-        
-        ### 🔍 验证 ECH 是否工作
-        
+        ### 验证 ECH 是否工作
         运行程序后，你应该看到类似的日志：
-        
-        ```
-        [启动] 正在获取 ECH 配置...
+        \`\`\`
         [ECH] 配置已加载，长度: 123 字节
-        [代理] 服务器启动: 127.0.0.1:30000 (支持 SOCKS5 和 HTTP)
-        [代理] 后端服务器: your-worker.workers.dev:443
-        ```
-        
-        如果看到 `[ECH] 配置已加载`，说明 ECH 功能已成功启用！
-        
-        ### 🔐 安全验证
-        
-        验证文件完整性：
-        
-        ```bash
-        # 下载校验和文件
-        wget https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/checksums.txt
-        
-        # Linux/macOS 验证
-        sha256sum -c checksums.txt
-        
-        # Windows PowerShell 验证
-        Get-FileHash proxy-client-ech-windows-amd64.exe -Algorithm SHA256
-        # 对比 checksums.txt 中的值
-        ```
-        
-        ### 📚 使用场景
-        
-        - 🌐 绕过基于 SNI 的网络审查
-        - 🔒 保护浏览隐私，防止 ISP 监控访问的域名
-        - 🚀 结合 Cloudflare Workers 构建安全代理
-        - 🛡️ 企业环境中的安全通信
-        
-        ### 💡 提示
-        
-        - 如果不需要 ECH 功能，可以使用标准版本以获得更小的二进制体积和更快的编译速度
-        - 建议使用 DoH (DNS over HTTPS) 以获得更好的隐私保护：`-dns https://1.1.1.1/dns-query`
-        - 配合浏览器扩展如 SwitchyOmega 使用效果更佳
-        
-        ### 🐛 问题反馈
-        
-        如遇到问题，请在 [Issues](https://github.com/${{ github.repository }}/issues) 中反馈。
+        [代理] 服务器启动: 127.0.0.1:1080
+        \`\`\`
         
         ---
         
-        **构建于 GitHub Actions** • **开源 • 免费 • 安全**
+        💡 **提示**: 如果不需要 ECH 功能，可以使用标准版本以获得更小的二进制体积。
         EOF
         
         cat release_notes.md
@@ -329,14 +148,13 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        name: 🔒 Release v${{ github.event.inputs.version }} (ECH Support)
+        name: Release v${{ github.event.inputs.version }} (ECH Support)
         tag_name: v${{ github.event.inputs.version }}
         body_path: release_notes.md
         draft: false
         prerelease: false
         files: |
           ./release/*.zip
-          ./release/*.tar.gz
           ./release/checksums.txt
         make_latest: false
     
@@ -346,21 +164,3 @@ jobs:
         name: binaries-ech-v${{ github.event.inputs.version }}
         path: ./release/
         retention-days: 30
-    
-    - name: Build summary
-      run: |
-        echo "# 🎉 构建成功！" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 📦 版本信息" >> $GITHUB_STEP_SUMMARY
-        echo "- **版本**: v${{ github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **ECH 支持**: ✅ 是" >> $GITHUB_STEP_SUMMARY
-        echo "- **Go 版本**: Cloudflare Go (cf branch)" >> $GITHUB_STEP_SUMMARY
-        echo "- **源文件**: ${{ github.event.inputs.source_file }}" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 📋 构建产物" >> $GITHUB_STEP_SUMMARY
-        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-        ls -lh ./release/*.zip ./release/*.tar.gz >> $GITHUB_STEP_SUMMARY
-        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 🔗 下载链接" >> $GITHUB_STEP_SUMMARY
-        echo "Release 已创建: [v${{ github.event.inputs.version }}](https://github.com/${{ github.repository }}/releases/tag/v${{ github.event.inputs.version }})" >> $GITHUB_STEP_SUMMARY
