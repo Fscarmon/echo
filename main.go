@@ -2,15 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	//"net/http"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +28,11 @@ var (
 	serverAddr string
 	serverIP   string
 	token      string
+	dnsServer  string
+	echDomain  string
+
+	echListMu sync.RWMutex
+	echList   []byte
 )
 
 func init() {
@@ -32,6 +40,8 @@ func init() {
 	flag.StringVar(&serverAddr, "f", "", "服务端地址 (格式: x.x.workers.dev:443)")
 	flag.StringVar(&serverIP, "ip", "", "指定服务端IP（绕过DNS解析）")
 	flag.StringVar(&token, "token", "", "身份验证令牌")
+	flag.StringVar(&dnsServer, "dns", "https://1.1.1.1/dns-query", "DNS服务器 (支持UDP和DoH格式)")
+	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH查询域名")
 }
 
 func main() {
@@ -41,7 +51,11 @@ func main() {
 		log.Fatal("必须指定服务端地址 -f\n\n示例:\n  ./client -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token")
 	}
 
-	log.Printf("[启动] 代理客户端 (不支持 ECH)")
+	log.Printf("[启动] 正在获取 ECH 配置...")
+	if err := prepareECH(); err != nil {
+		log.Fatalf("[启动] 获取 ECH 配置失败: %v", err)
+	}
+
 	runProxyServer(listenAddr)
 }
 
@@ -61,16 +75,219 @@ func isNormalCloseError(err error) bool {
 		strings.Contains(errStr, "normal closure")
 }
 
-func buildTLSConfig(serverName string) (*tls.Config, error) {
+// ======================== ECH 支持 ========================
+
+const typeHTTPS = 65
+
+func prepareECH() error {
+	echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
+	if err != nil {
+		return fmt.Errorf("DNS 查询失败: %w", err)
+	}
+	if echBase64 == "" {
+		return errors.New("未找到 ECH 参数")
+	}
+	raw, err := base64.StdEncoding.DecodeString(echBase64)
+	if err != nil {
+		return fmt.Errorf("ECH 解码失败: %w", err)
+	}
+	echListMu.Lock()
+	echList = raw
+	echListMu.Unlock()
+	log.Printf("[ECH] 配置已加载，长度: %d 字节", len(raw))
+	return nil
+}
+
+func refreshECH() error {
+	log.Printf("[ECH] 刷新配置...")
+	return prepareECH()
+}
+
+func getECHList() ([]byte, error) {
+	echListMu.RLock()
+	defer echListMu.RUnlock()
+	if len(echList) == 0 {
+		return nil, errors.New("ECH 配置未加载")
+	}
+	return echList, nil
+}
+
+func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
 	roots, err := x509.SystemCertPool()
 	if err != nil {
 		return nil, fmt.Errorf("加载系统根证书失败: %w", err)
 	}
 	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		ServerName: serverName,
-		RootCAs:    roots,
+		MinVersion:                     tls.VersionTLS13,
+		ServerName:                     serverName,
+		EncryptedClientHelloConfigList: echList,
+		EncryptedClientHelloRejectionVerify: func(cs tls.ConnectionState) error {
+			return errors.New("服务器拒绝 ECH")
+		},
+		RootCAs: roots,
 	}, nil
+}
+
+// ======================== DNS 查询（支持UDP和DoH）========================
+
+func queryHTTPSRecord(domain, dnsServer string) (string, error) {
+	// 检查是否为DoH URL
+	if strings.HasPrefix(dnsServer, "https://") || strings.HasPrefix(dnsServer, "http://") {
+		return queryHTTPSRecordDoH(domain, dnsServer)
+	}
+	// 传统UDP DNS查询
+	return queryHTTPSRecordUDP(domain, dnsServer)
+}
+
+// DoH (DNS over HTTPS) 查询
+func queryHTTPSRecordDoH(domain, dohURL string) (string, error) {
+	query := buildDNSQuery(domain, typeHTTPS)
+	
+	// 构建DoH请求
+	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(query))
+	if err != nil {
+		return "", fmt.Errorf("创建DoH请求失败: %w", err)
+	}
+	
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("DoH请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("DoH响应错误: %d", resp.StatusCode)
+	}
+	
+	response, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取DoH响应失败: %w", err)
+	}
+	
+	return parseDNSResponse(response)
+}
+
+// 传统UDP DNS查询
+func queryHTTPSRecordUDP(domain, dnsServer string) (string, error) {
+	query := buildDNSQuery(domain, typeHTTPS)
+
+	conn, err := net.Dial("udp", dnsServer)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	if _, err = conn.Write(query); err != nil {
+		return "", err
+	}
+
+	response := make([]byte, 4096)
+	n, err := conn.Read(response)
+	if err != nil {
+		return "", err
+	}
+	return parseDNSResponse(response[:n])
+}
+
+func buildDNSQuery(domain string, qtype uint16) []byte {
+	query := make([]byte, 0, 512)
+	query = append(query, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+	for _, label := range strings.Split(domain, ".") {
+		query = append(query, byte(len(label)))
+		query = append(query, []byte(label)...)
+	}
+	query = append(query, 0x00, byte(qtype>>8), byte(qtype), 0x00, 0x01)
+	return query
+}
+
+func parseDNSResponse(response []byte) (string, error) {
+	if len(response) < 12 {
+		return "", errors.New("响应过短")
+	}
+	ancount := binary.BigEndian.Uint16(response[6:8])
+	if ancount == 0 {
+		return "", errors.New("无应答记录")
+	}
+
+	offset := 12
+	for offset < len(response) && response[offset] != 0 {
+		offset += int(response[offset]) + 1
+	}
+	offset += 5
+
+	for i := 0; i < int(ancount); i++ {
+		if offset >= len(response) {
+			break
+		}
+		if response[offset]&0xC0 == 0xC0 {
+			offset += 2
+		} else {
+			for offset < len(response) && response[offset] != 0 {
+				offset += int(response[offset]) + 1
+			}
+			offset++
+		}
+		if offset+10 > len(response) {
+			break
+		}
+		rrType := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 8
+		dataLen := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 2
+		if offset+int(dataLen) > len(response) {
+			break
+		}
+		data := response[offset : offset+int(dataLen)]
+		offset += int(dataLen)
+
+		if rrType == typeHTTPS {
+			if ech := parseHTTPSRecord(data); ech != "" {
+				return ech, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+func parseHTTPSRecord(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	offset := 2
+	if offset < len(data) && data[offset] == 0 {
+		offset++
+	} else {
+		for offset < len(data) && data[offset] != 0 {
+			offset += int(data[offset]) + 1
+		}
+		offset++
+	}
+	for offset+4 <= len(data) {
+		key := binary.BigEndian.Uint16(data[offset : offset+2])
+		length := binary.BigEndian.Uint16(data[offset+2 : offset+4])
+		offset += 4
+		if offset+int(length) > len(data) {
+			break
+		}
+		value := data[offset : offset+int(length)]
+		offset += int(length)
+		if key == 5 {
+			return base64.StdEncoding.EncodeToString(value)
+		}
+	}
+	return ""
 }
 
 // ======================== WebSocket 客户端 ========================
@@ -91,7 +308,7 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	return host, port, path, nil
 }
 
-func dialWebSocket(maxRetries int) (*websocket.Conn, error) {
+func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 	host, port, path, err := parseServerAddr(serverAddr)
 	if err != nil {
 		return nil, err
@@ -100,7 +317,16 @@ func dialWebSocket(maxRetries int) (*websocket.Conn, error) {
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		tlsCfg, tlsErr := buildTLSConfig(host)
+		echBytes, echErr := getECHList()
+		if echErr != nil {
+			if attempt < maxRetries {
+				refreshECH()
+				continue
+			}
+			return nil, echErr
+		}
+
+		tlsCfg, tlsErr := buildTLSConfigWithECH(host, echBytes)
 		if tlsErr != nil {
 			return nil, tlsErr
 		}
@@ -128,8 +354,9 @@ func dialWebSocket(maxRetries int) (*websocket.Conn, error) {
 
 		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
 		if dialErr != nil {
-			if attempt < maxRetries {
-				log.Printf("[连接] 连接失败，重试 (%d/%d): %v", attempt, maxRetries, dialErr)
+			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
+				log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries)
+				refreshECH()
 				time.Sleep(time.Second)
 				continue
 			}
@@ -155,6 +382,13 @@ func runProxyServer(addr string) {
 	log.Printf("[代理] 后端服务器: %s", serverAddr)
 	if serverIP != "" {
 		log.Printf("[代理] 使用固定 IP: %s", serverIP)
+	}
+	
+	// 显示DNS配置
+	if strings.HasPrefix(dnsServer, "https://") {
+		log.Printf("[DNS] 使用 DoH: %s", dnsServer)
+	} else {
+		log.Printf("[DNS] 使用 UDP: %s", dnsServer)
 	}
 
 	for {
@@ -413,7 +647,7 @@ const (
 )
 
 func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
-	wsConn, err := dialWebSocket(2)
+	wsConn, err := dialWebSocketWithECH(2)
 	if err != nil {
 		sendErrorResponse(conn, mode)
 		return err
